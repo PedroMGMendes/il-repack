@@ -35,7 +35,9 @@
   <ItemGroup>
     <PackageReference Include="BamlParser" Version="1.0.1" />
     <PackageReference Include="fasterflect" Version="3.0.0" />
+    <PackageReference Include="Microsoft.CSharp" Version="4.7.0" />
     <PackageReference Include="SourceLink" Version="1.1.0" GeneratePathProperty="true" />
+    <PackageReference Include="System.CodeDom" Version="9.0.2" />
   </ItemGroup>
 
   <ItemGroup>

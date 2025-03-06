@@ -311,34 +311,6 @@ namespace ILRepacking
 
         private void RepackCore(string tempOutputDirectory)
         {
-            Options.Validate();
-
-            string outputFilePath = Options.OutputFile;
-            var outputDir = Path.GetDirectoryName(outputFilePath);
-            var tempOutputDirectory = Path.Combine(outputDir, $"ILRepack-{Process.GetCurrentProcess().Id}-{DateTime.UtcNow.Ticks.ToString().Substring(12)}");
-            EnsureDirectoryExists(tempOutputDirectory);
-
-            try
-            {
-                RepackCore(tempOutputDirectory);
-            }
-            finally
-            {
-                try
-                {
-                    if (Directory.Exists(tempOutputDirectory))
-                    {
-                        Directory.Delete(tempOutputDirectory, recursive: true);
-                    }
-                }
-                catch
-                {
-                }
-            }
-        }
-
-        private void RepackCore(string tempOutputDirectory)
-        {
             Debugger.Launch();
             var timer = new Stopwatch();
             timer.Start();
