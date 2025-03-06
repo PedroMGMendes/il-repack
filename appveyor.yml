@@ -1,10 +1,20 @@
 version: 1.0.{build}
-os: Previous Visual Studio 2017
+os: Visual Studio 2022
 install:
 - git submodule update --init --recursive
 build_script:
-- gradlew.bat -is nunit nugetPack
-test: off
+- msbuild /r /m /bl /p:Configuration=Release
+test:
+  assemblies:
+    only:
+      - ILRepack.Tests.dll
+      - ILRepack.IntegrationTests.dll
 artifacts:
-  - path: 'build\distributions\*.nupkg'
+  - path: 'ILRepack\bin\Release\net472\*.nupkg'
     name: Nuget
+  - path: 'ILRepackTool\bin\Release\dotnet-ilrepack*.nupkg'
+    name: 'dotnet-ilrepack.nupkg'
+  - path: 'msbuild.binlog'
+    name: 'MSBuild binlog'
+on_failure:
+- appveyor PushArtifact msbuild.binlog

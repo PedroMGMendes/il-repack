@@ -1,0 +1,32 @@
+<Project>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\ILRepack\ILRepack.csproj" ReferenceOutputAssembly="false" OutputItemType="ILRepackExe" />
+  </ItemGroup>
+
+  <Target Name="GatherInputs">
+    <ItemGroup>
+      <ILRepackInput Include="$(TargetDir)\*.dll" />
+      <ILRepackInput Remove="$(TargetDir)$(TargetFileName)" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="Repack"
+          DependsOnTargets="GatherInputs"
+          AfterTargets="Build"
+          Inputs="@(ILRepackInput);@(ILRepackExe);$(TargetPath);$(MSBuildThisFileFullPath)"
+          Outputs="$(TargetDir)\merged\$(TargetFileName)">
+    <MakeDir Directories="$(TargetDir)merged" />
+    <PropertyGroup>
+      <ILRepackVerboseArgument Condition="$(ILRepackVerbose) == true"> /verbose</ILRepackVerboseArgument>
+    </PropertyGroup>
+    <Exec Command="&quot;@(ILRepackExe)&quot; $(ILRepackExtraArgs)$(ILRepackVerboseArgument) /log /out:$(TargetDir)merged\$(TargetFileName) $(TargetFileName) @(ILRepackInput->'%(Filename)%(Extension)', ' ')"
+        WorkingDirectory="$(TargetDir)"
+        ConsoleToMSBuild="True" />
+    <Copy Condition="Exists('$(ProjectRuntimeConfigFilePath)')"
+          SourceFiles="$(ProjectRuntimeConfigFilePath)"
+          DestinationFiles="$(TargetDir)\merged\$(ProjectRuntimeConfigFileName)"
+          SkipUnchangedFiles="True" />
+  </Target>
+
+</Project>

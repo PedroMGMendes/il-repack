@@ -1,8 +1,6 @@
 syntax: glob
 
 _ReSharper*
-.gitignore
-.git
 .settings
 .classpath
 .project
@@ -30,5 +28,6 @@ _NCrunch*
 *.ncrunchproject
 *.sln.cache
 *.DotSettings
-/.vs
+.vs
 /.idea
+*.binlog

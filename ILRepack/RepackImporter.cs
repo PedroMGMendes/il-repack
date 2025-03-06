@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
+using ILRepacking.Mixins;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 using Mono.Collections.Generic;
@@ -29,6 +30,10 @@ namespace ILRepacking
         private readonly IRepackContext _repackContext;
         private readonly RepackOptions _options;
         private readonly Dictionary<AssemblyDefinition, int> _aspOffsets;
+        private readonly Dictionary<ImportDebugInformation, ImportDebugInformation> _importDebugInformations = new();
+        private readonly static Instruction _dummyInstruction = Instruction.Create(OpCodes.Nop);
+
+        const string ExcludeInternalizeAttName = "RepackExcludeInternalizeAttribute";
 
         public RepackImporter(
             ILogger logger,
@@ -42,9 +47,10 @@ namespace ILRepacking
             _aspOffsets = aspOffsets;
         }
 
-        public void Import(ExportedType type, Collection<ExportedType> col, ModuleDefinition module)
+        public void Import(ExportedType type, Collection<ExportedType> exportedTypesCollection, ModuleDefinition targetAssemblyMainModule)
         {
             var scope = default(IMetadataScope);
+
             // try to skip redirects to merged assemblies
             if (type.Scope is AssemblyNameReference)
             {
@@ -52,6 +58,7 @@ namespace ILRepacking
                 {
                     return;
                 }
+
                 scope = _repackContext.PlatformFixer.FixPlatformVersion(((AssemblyNameReference)type.Scope));
             }
             else if (type.Scope is ModuleReference)
@@ -60,26 +67,30 @@ namespace ILRepacking
                 {
                     return;
                 }
+
                 // TODO fix scope (should probably be added to target ModuleReferences, otherwise metadatatoken will be wrong)
                 // I've never seen an exported type redirected to a module, doing so would be blind guessing
                 scope = type.Scope;
             }
+
             if (type.IsForwarder)
             {
                 // Skip duplicated forwarders
                 var fullName = type.FullName;
-                if (col.Any(t => t.IsForwarder && t.FullName == fullName))
+                if (exportedTypesCollection.Any(t => t.IsForwarder && t.FullName == fullName))
                 {
                     return;
                 }
             }
-            var nt = new ExportedType(type.Namespace, type.Name, module, scope)
+
+            var newExportedType = new ExportedType(type.Namespace, type.Name, targetAssemblyMainModule, scope)
             {
                 Attributes = type.Attributes,
                 Identifier = type.Identifier, // TODO: CHECK THIS when merging multiple assemblies when exported types ?
                 DeclaringType = type.DeclaringType
             };
-            col.Add(nt);
+
+            exportedTypesCollection.Add(newExportedType);
         }
 
         public TypeReference Import(TypeReference reference, IGenericParameterProvider context)
@@ -134,30 +145,51 @@ namespace ILRepacking
                 return null;
             }
 
-            TypeDefinition nt = _repackContext.TargetAssemblyMainModule.GetType(type.FullName);
+            TypeDefinition nt = _repackContext.TargetAssemblyMainModule.Types.FirstOrDefault(x => x.Name == type.Name && x.Namespace == type.Namespace);
             bool justCreatedType = false;
             if (nt == null)
             {
                 nt = CreateType(type, col, internalize, null);
                 justCreatedType = true;
+
+                if (IsWellKnownType(type))
+                {
+                    internalize = false;
+                }
             }
             else if (DuplicateTypeAllowed(type))
             {
-                _logger.Info("Merging " + type);
+                _logger.Verbose("Merging " + type);
+                internalize = false;
             }
             else if (!type.IsPublic || internalize)
             {
+                var originalModule = _repackContext.MappingHandler.GetOriginalModule(nt);
+                _logger.Verbose($"- Renaming previously imported type {nt.FullName} from {originalModule.Name}");
+                
                 // rename the type previously imported.
                 // renaming the new one before import made Cecil throw an exception.
-                string other = GenerateName(nt);
-                _logger.Info("Renaming " + nt.FullName + " into " + other);
+                string other = GenerateName(nt, originalModule?.Mvid.ToString());
+                
+                //Check whether renamed type already exists
+                TypeDefinition otherNt = _repackContext.TargetAssemblyMainModule.Types.FirstOrDefault(x => x.Name == other && x.Namespace == nt.Namespace);
+                if (otherNt != null)
+                {
+                    var otherOriginalModule = _repackContext.MappingHandler.GetOriginalModule(otherNt);
+                    _logger.Verbose($"- Collision found with type {otherNt.FullName} from {otherOriginalModule.Name}. Renaming now to a random name");
+                    //Create a random name
+                    other = GenerateName(nt);
+                }
+
+                _logger.Verbose($"- Renaming {nt.FullName} from {originalModule.Name} into {nt.Namespace}.{other}");
                 nt.Name = other;
                 nt = CreateType(type, col, internalize, null);
                 justCreatedType = true;
             }
             else if (_options.UnionMerge)
             {
-                _logger.Info("Merging " + type);
+                _logger.Verbose("Merging " + type);
+                internalize = false;
             }
             else
             {
@@ -206,9 +238,9 @@ namespace ILRepacking
                 }
             }
 
-            if (internalize && _options.RenameInternalized && !IsModuleTag(nt))
+            if (internalize && _options.RenameInternalized)
             {
-                string newName = GenerateName(nt);
+                string newName = GenerateName(nt, type.Module.Mvid.ToString());
                 _logger.Verbose("Renaming " + nt.FullName + " into " + newName);
                 nt.Name = newName;
             }            
@@ -221,13 +253,10 @@ namespace ILRepacking
             return nt;
         }        
 
-        //Module tag must't be renamed. Otherwise after two repacks .dll will contain <Model> and <Guid><Model>
-        //Assembly.Load() will load <Guid><Module> as type and crash
-        private static bool IsModuleTag(TypeDefinition nt) => nt.FullName == "<Module>";
-
-        private string GenerateName(TypeDefinition typeDefinition)
+        private string GenerateName(TypeDefinition typeDefinition, string disambiguator = null)
         {
-            return "<" + Guid.NewGuid() + ">" + typeDefinition.Name;
+            disambiguator ??= Guid.NewGuid().ToString();
+            return $"<{disambiguator}>{typeDefinition.Name}";
         }
 
         private void ProcessNameSpaceReplace(ref TypeDefinition typeDefinition)
@@ -246,19 +275,28 @@ namespace ILRepacking
 
         private bool ShouldDrop<TMember>(TMember member) where TMember : ICustomAttributeProvider, IMemberDefinition
         {
-            bool hasFilter = String.IsNullOrEmpty(_options.RepackDropAttribute) == false;
-            if (hasFilter == false)
+            var dropAttributes = _options.RepackDropAttributes;
+            if (!dropAttributes.Any())
             {
                 return false;
             }
-            // skip members marked with a custom attribute named as /repackdrop:RepackDropAttribute
-            var shouldDrop = member.HasCustomAttributes
-                && member.CustomAttributes.FirstOrDefault(attr => attr.AttributeType.Name == _options.RepackDropAttribute) != null;
-            if (shouldDrop)
+
+            if (!member.HasCustomAttributes)
             {
-                _logger.Log("Repack dropped " + typeof(TMember).Name + ": " + member.FullName + " as it was marked with " + _options.RepackDropAttribute);
+                return false;
             }
-            return shouldDrop;
+
+            // skip members marked with a custom attribute named as /repackdrop:RepackDropAttribute
+            var dropAttribute = member.CustomAttributes.FirstOrDefault(attr => 
+                dropAttributes.Contains(attr.AttributeType.Name) ||
+                dropAttributes.Contains(attr.AttributeType.FullName));
+            if (dropAttribute != null)
+            {
+                _logger.Verbose("Repack dropped " + typeof(TMember).Name + ": " + member.FullName + " as it was marked with " + dropAttribute.AttributeType.FullName);
+                return true;
+            }
+
+            return false;
         }
 
         // Real stuff below //
@@ -273,7 +311,6 @@ namespace ILRepacking
         {
             if (nt.Fields.Any(x => x.Name == field.Name))
             {
-                _logger.DuplicateIgnored("field", field);
                 return;
             }
             FieldDefinition nf = new FieldDefinition(field.Name, field.Attributes, Import(field.FieldType, nt));
@@ -314,7 +351,6 @@ namespace ILRepacking
             // ignore duplicate event
             if (nt.Events.Any(x => x.Name == evt.Name))
             {
-                _logger.DuplicateIgnored("event", evt);
                 return;
             }
 
@@ -365,7 +401,6 @@ namespace ILRepacking
                 }
                 if (skip)
                 {
-                    _logger.DuplicateIgnored("property", prop);
                     return;
                 }
             }
@@ -399,12 +434,15 @@ namespace ILRepacking
                   (x.Parameters.Count == meth.Parameters.Count) &&
                   (x.ToString() == meth.ToString()))) // TODO: better/faster comparation of parameter types?
             {
-                _logger.DuplicateIgnored("method", meth);
                 return;
             }
             // use void placeholder as we'll do the return type import later on (after generic parameters)
             MethodDefinition nm = new MethodDefinition(meth.Name, meth.Attributes, _repackContext.TargetAssemblyMainModule.TypeSystem.Void);
             nm.ImplAttributes = meth.ImplAttributes;
+            if (meth.DebugInformation.HasCustomDebugInformations)
+                nm.DebugInformation.CustomDebugInformations.AddRange(meth.DebugInformation.CustomDebugInformations);
+            if (meth.DebugInformation.HasSequencePoints)
+                nm.DebugInformation.SequencePoints.AddRange(meth.DebugInformation.SequencePoints);
 
             type.Methods.Add(nm);
 
@@ -443,6 +481,9 @@ namespace ILRepacking
 
             if (meth.HasBody)
                 CloneTo(meth.Body, nm);
+
+            nm.DebugInformation.Scope = CopyScope(meth.DebugInformation.Scope, nm, out _);
+
             meth.Body = null; // frees memory
 
             nm.IsAddOn = meth.IsAddOn;
@@ -450,6 +491,72 @@ namespace ILRepacking
             nm.IsGetter = meth.IsGetter;
             nm.IsSetter = meth.IsSetter;
             nm.CallingConvention = meth.CallingConvention;
+        }
+
+        private ScopeDebugInformation CopyScope(ScopeDebugInformation scope, MethodDefinition nm, out bool copied)
+        {
+            copied = false;
+            if (scope is null || scope.Import is null && !scope.HasConstants && !scope.HasScopes)
+                return scope;
+
+            var ns = new ScopeDebugInformation(_dummyInstruction, null);
+            ns.Start = new InstructionOffset(scope.Start.Offset);
+            ns.End = scope.End.IsEndOfMethod ? default : new InstructionOffset(scope.End.Offset);
+            if (scope.HasCustomDebugInformations)
+                ns.CustomDebugInformations.AddRange(scope.CustomDebugInformations);
+            if (scope.HasVariables)
+                ns.Variables.AddRange(scope.Variables);
+            if (scope.HasScopes)
+                foreach (var ps in scope.Scopes)
+                {
+                    ns.Scopes.Add(CopyScope(ps, nm, out var nc));
+                    copied |= nc;
+                }
+            if (scope.HasConstants)
+            {
+                copied = true;
+                foreach (var pc in scope.Constants)
+                {
+                    var nc = new ConstantDebugInformation(pc.Name, Import(pc.ConstantType, nm), pc.Value);
+                    if (pc.HasCustomDebugInformations)
+                        nc.CustomDebugInformations.AddRange(pc.CustomDebugInformations);
+                    ns.Constants.Add(nc);
+                }
+            }
+            if (scope.Import is not null)
+            {
+                copied = true;
+                ns.Import = CopyImport(scope.Import, nm);
+            }
+
+            return copied ? ns : scope;
+        }
+
+        private ImportDebugInformation CopyImport(ImportDebugInformation import, MethodDefinition nm)
+        {
+            if (import is null)
+                return null;
+            if (_importDebugInformations.TryGetValue(import, out var ni))
+                return ni;
+
+            ni = new ImportDebugInformation();
+            ni.Parent = CopyImport(import.Parent, nm);
+            if (import.HasCustomDebugInformations)
+                ni.CustomDebugInformations.AddRange(import.CustomDebugInformations);
+            if (import.HasTargets)
+                foreach (var pt in import.Targets)
+                {
+                    var nt = new ImportTarget(pt.Kind);
+                    nt.Alias = pt.Alias;
+                    nt.Namespace = pt.Namespace;
+                    if (pt.Type is not null)
+                        nt.Type = Import(pt.Type, nm);
+                    if (pt.AssemblyReference is not null)
+                        nt.AssemblyReference = _repackContext.PlatformFixer.FixPlatformVersion(pt.AssemblyReference) as AssemblyNameReference;
+                    ni.Targets.Add(nt);
+                }
+            _importDebugInformations.Add(import, ni);
+            return ni;
         }
 
         private void CloneTo(MethodBody body, MethodDefinition parent)
@@ -462,15 +569,13 @@ namespace ILRepacking
             nb.LocalVarToken = body.LocalVarToken;
 
             foreach (VariableDefinition var in body.Variables)
-                nb.Variables.Add(new VariableDefinition(var.Name,
+                nb.Variables.Add(new VariableDefinition(
                     Import(var.VariableType, parent)));
 
-            nb.Instructions.SetCapacity(body.Instructions.Count);
+            nb.Instructions.Capacity = Math.Max(nb.Instructions.Capacity, body.Instructions.Count);
             _repackContext.LineIndexer.PreMethodBodyRepack(body, parent);
             foreach (Instruction instr in body.Instructions)
             {
-                _repackContext.LineIndexer.ProcessMethodBodyInstruction(instr);
-
                 Instruction ni;
 
                 if (instr.OpCode.Code == Code.Calli)
@@ -559,10 +664,8 @@ namespace ILRepacking
                         default:
                             throw new InvalidOperationException();
                     }
-                ni.SequencePoint = instr.SequencePoint;
                 nb.Instructions.Add(ni);
             }
-            _repackContext.LineIndexer.PostMethodBodyRepack(parent);
 
             for (int i = 0; i < body.Instructions.Count; i++)
             {
@@ -609,7 +712,7 @@ namespace ILRepacking
             col.Add(nt);
 
             // only top-level types are internalized
-            if (internalize && (nt.DeclaringType == null) && nt.IsPublic)
+            if (internalize && (nt.DeclaringType == null) && nt.IsPublic && !type.CustomAttributes.Any(x => x.AttributeType.Name == ExcludeInternalizeAttName))
                 nt.IsPublic = false;
 
             CopyGenericParameters(type.GenericParameters, nt.GenericParameters, nt);
@@ -624,9 +727,19 @@ namespace ILRepacking
             // don't copy these twice if UnionMerge==true
             // TODO: we can move this down if we chek for duplicates when adding
             CopySecurityDeclarations(type.SecurityDeclarations, nt.SecurityDeclarations, nt);
-            CopyTypeReferences(type.Interfaces, nt.Interfaces, nt);
+            CopyInterfaces(type.Interfaces, nt.Interfaces, nt);
             CopyCustomAttributes(type.CustomAttributes, nt.CustomAttributes, nt);
             return nt;
+        }
+
+        private void CopyInterfaces(Collection<InterfaceImplementation> interfaces1, Collection<InterfaceImplementation> interfaces2, TypeDefinition nt)
+        {
+            foreach (var iface in interfaces1)
+            {
+                var newIface = new InterfaceImplementation(Import(iface.InterfaceType, nt));
+                CopyCustomAttributes(iface.CustomAttributes, newIface.CustomAttributes, nt);
+                interfaces2.Add(newIface);
+            }
         }
 
         private MethodDefinition FindMethodInNewType(TypeDefinition nt, MethodDefinition methodDefinition)
@@ -659,7 +772,7 @@ namespace ILRepacking
 
         private static bool IsIndexer(PropertyDefinition prop)
         {
-            if (prop.Name != "Item")
+            if (prop.Name != "Item" && !prop.Name.EndsWith(".Item")) // cover explicitely implemented properties
                 return false;
             var parameters = ExtractIndexerParameters(prop);
             return parameters != null && parameters.Count > 0;
@@ -683,15 +796,52 @@ namespace ILRepacking
             return null /*newBody.Instructions.Outside*/;
         }
 
+        // https://github.com/dotnet/roslyn/blob/ee2526876b7bff3380bc110d819dda23cac668a5/src/Compilers/CSharp/Portable/Symbols/EmbeddableAttributes.cs#L10
+        private static readonly HashSet<string> allowUnifyTypeNames = new HashSet<string>
+        {
+            "System.Runtime.CompilerServices.IsReadOnlyAttribute",
+            "System.Runtime.CompilerServices.IsByRefLikeAttribute",
+            "System.Runtime.CompilerServices.IsUnmanagedAttribute",
+            "System.Runtime.CompilerServices.NullableAttribute",
+            "System.Runtime.CompilerServices.NullableContextAttribute",
+            "System.Runtime.CompilerServices.NullablePublicOnlyAttribute",
+            "System.Runtime.CompilerServices.NativeIntegerAttribute",
+            "System.Runtime.CompilerServices.ScopedRefAttribute",
+            "System.Runtime.CompilerServices.RefSafetyRulesAttribute",
+            "System.Runtime.CompilerServices.RequiresLocationAttribute",
+            "Microsoft.CodeAnalysis.EmbeddedAttribute"
+        };
+
         private bool DuplicateTypeAllowed(TypeDefinition type)
         {
+            if (IsWellKnownType(type))
+            {
+                return true;
+            }
+
+            if (_options.AllowAllDuplicateTypes || _options.AllowedDuplicateTypes.Contains(type.FullName))
+                return true;
+
+            var top = type;
+            while (top.IsNested)
+                top = top.DeclaringType;
+            string nameSpace = top.Namespace;
+            if (!String.IsNullOrEmpty(nameSpace) && _options.AllowedDuplicateNameSpaces.Any(s => s == nameSpace || nameSpace.StartsWith(s + ".")))
+                return true;
+
+            return false;
+        }
+
+        private bool IsWellKnownType(TypeDefinition type)
+        {
             string fullName = type.FullName;
+
             // Merging module because IKVM uses this class to store some fields.
             // Doesn't fully work yet, as IKVM is nice enough to give all the fields the same name...
             if (fullName == "<Module>" || fullName == "__<Proxy>")
                 return true;
 
-            // XAML helper class, identical in all assemblies, unused within the assembly, and instanciated through reflection from the outside
+            // XAML helper class, identical in all assemblies, unused within the assembly, and instantiated through reflection from the outside
             // We could just skip them after the first one, but merging them works just fine
             if (fullName == "XamlGeneratedNamespace.GeneratedInternalTypeHelper")
                 return true;
@@ -701,15 +851,10 @@ namespace ILRepacking
             if (fullName == "<PrivateImplementationDetails>" && type.IsPublic)
                 return true;
 
-            if (_options.AllowedDuplicateTypes.Contains(fullName))
+            if (allowUnifyTypeNames.Contains(fullName))
+            {
                 return true;
-
-            var top = type;
-            while (top.IsNested)
-                top = top.DeclaringType;
-            string nameSpace = top.Namespace;
-            if (!String.IsNullOrEmpty(nameSpace) && _options.AllowedDuplicateNameSpaces.Any(s => s == nameSpace || nameSpace.StartsWith(s + ".")))
-                return true;
+            }
 
             return false;
         }
@@ -800,6 +945,8 @@ namespace ILRepacking
             var reflectionHelper = _repackContext.ReflectionHelper;
             foreach (CustomAttribute ca in input)
             {
+                if (ca.AttributeType.Name == ExcludeInternalizeAttName) continue;
+
                 var caType = ca.AttributeType;
                 var similarAttributes = output.Where(attr => reflectionHelper.AreSame(attr.AttributeType, caType)).ToList();
                 if (similarAttributes.Count != 0)
@@ -848,6 +995,16 @@ namespace ILRepacking
             foreach (TypeReference ta in input)
             {
                 output.Add(Import(ta, context));
+            }
+        }
+
+        public void CopyTypeReferences(Collection<GenericParameterConstraint> input, Collection<GenericParameterConstraint> output, IGenericParameterProvider context)
+        {
+            foreach (var gpc in input)
+            {
+                var result = new GenericParameterConstraint(Import(gpc.ConstraintType, context));
+                CopyCustomAttributes(gpc.CustomAttributes, result.CustomAttributes, context);
+                output.Add(result);
             }
         }
 

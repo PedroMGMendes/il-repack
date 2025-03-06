@@ -21,7 +21,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Resources;
-using System.Runtime.Serialization.Formatters.Binary;
+using System.Runtime.Serialization;
 
 namespace ILRepacking.Steps
 {
@@ -46,7 +46,7 @@ namespace ILRepacking.Steps
 
         public void Perform()
         {
-            _logger.Info("Processing resources");
+            _logger.Verbose("Processing resources");
 
             // merge resources
             IEnumerable<string> repackList = new List<string>();
@@ -156,7 +156,7 @@ namespace ILRepacking.Steps
 
             if (!_options.NoRepackRes)
                 _targetAssemblyMainModule.Resources.Add(
-                    GenerateRepackListResource(repackList.ToList()));
+                    GenerateRepackListResource(repackList));
 
             CreateNewBamlResourceIfNeeded(areCollectedStreamsWritten, bamlStreamCollector);
         }
@@ -266,9 +266,12 @@ namespace ILRepacking.Steps
             MemoryStream stream = (MemoryStream)er.GetResourceStream();
             var output = new MemoryStream((int)stream.Length);
             var rw = new ResourceWriter(output);
+            var resourceBytes = stream.ToArray();
+            string readerType;
 
             using (var rr = new ResReader(stream))
             {
+                readerType = rr.ReaderType;
                 foreach (var res in rr)
                 {
                     foreach (var processor in resourcePrcessors)
@@ -287,22 +290,36 @@ namespace ILRepacking.Steps
 
             rw.Generate();
             output.Position = 0;
+
+            if (readerType.StartsWith("System.Resources.Extensions.DeserializingResourceReader"))
+            {
+                // Bugfix#277 
+                // Default ResourceWriter creates incompatible resourses for NET Core WindowsForms applications 
+                // because the new deserializer of type "System.Resources.Extensions.DeserializingResourceReader" is used there.
+                // Therefore unchanged original resourceBytes must be passed in EmbeddedResource constructor for an NET Core WindowsForms applications
+                // if the readerType is the new type "System.Resources.Extensions.DeserializingResourceReader"
+                return new EmbeddedResource(er.Name, er.Attributes, new MemoryStream(resourceBytes));
+            }
+
             return new EmbeddedResource(er.Name, er.Attributes, output);
         }
 
-        private static string[] GetRepackListFromResource(EmbeddedResource resource)
+        public static string[] GetRepackListFromResource(EmbeddedResource resource)
         {
-            return (string[])new BinaryFormatter().Deserialize(resource.GetResourceStream());
+            return GetRepackListFromStream(resource.GetResourceStream());
         }
 
-        private static EmbeddedResource GenerateRepackListResource(List<string> repackList)
+        public static string[] GetRepackListFromStream(Stream stream)
         {
-            repackList.Sort();
-            using (var stream = new MemoryStream())
-            {
-                new BinaryFormatter().Serialize(stream, repackList.ToArray());
-                return new EmbeddedResource(ILRepackListResourceName, ManifestResourceAttributes.Public, stream.ToArray());
-            }
+            return StringArrayBinaryFormatter.Deserialize(stream);
+        }
+
+        public static EmbeddedResource GenerateRepackListResource(IEnumerable<string> repackList)
+        {
+            var sorted = repackList.OrderBy(s => s).ToArray();
+            var stream = new MemoryStream();
+            StringArrayBinaryFormatter.Serialize(stream, sorted);
+            return new EmbeddedResource(ILRepackListResourceName, ManifestResourceAttributes.Public, stream.ToArray());
         }
     }
 }

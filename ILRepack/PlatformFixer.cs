@@ -18,9 +18,37 @@ using Mono.Cecil;
 using System;
 using System.Collections;
 using System.IO;
+using System.Linq;
 
 namespace ILRepacking
 {
+    internal class PlatformAndDuplicateFixer : PlatformFixer
+    {
+        private readonly IRepackContext _repack;
+
+        public PlatformAndDuplicateFixer(IRepackContext repack, TargetRuntime runtime) : base(repack, runtime)
+        {
+            _repack = repack;
+        }
+
+        protected override IMetadataScope GetFixedPlatformVersion(AssemblyNameReference assyName)
+        {
+            var baseResult = base.GetFixedPlatformVersion(assyName);
+            if (baseResult is AssemblyNameReference refName)
+            {
+                assyName = refName;
+            }
+            var sameRef = _repack.TargetAssemblyMainModule.AssemblyReferences.FirstOrDefault(a => a.Name == assyName.Name);
+            if (sameRef != null && sameRef.Version > assyName.Version)
+            {
+                var ret = _repack.MergeScope(sameRef);
+                return ret;
+            }
+
+            return baseResult;
+        }
+    }
+
     internal class PlatformFixer
     {
         readonly IRepackContext repack;
@@ -77,7 +105,7 @@ namespace ILRepacking
             return GetFixedPlatformVersion(assyName) ?? repack.MergeScope(assyName);
         }
 
-        IMetadataScope GetFixedPlatformVersion(AssemblyNameReference assyName)
+        protected virtual IMetadataScope GetFixedPlatformVersion(AssemblyNameReference assyName)
         {
             if (targetPlatformDirectory == null)
                 return null;
@@ -89,17 +117,40 @@ namespace ILRepacking
             return ret;
         }
 
-        public void FixPlatformVersion(TypeReference reference)
+        public void FixPlatformVersion(ExportedType exported)
         {
-            if (reference == null || targetPlatformDirectory == null)
+            if (exported == null)
                 return;
 
-            AssemblyNameReference scopeAsm = reference.Scope as AssemblyNameReference;
+            AssemblyNameReference scopeAsm = exported.Scope as AssemblyNameReference;
             if (scopeAsm == null)
                 return;
 
             var platformAsm = GetFixedPlatformVersion(scopeAsm);
             if (platformAsm == null)
+                return;
+
+            exported.Scope = platformAsm; 
+        }
+
+        public void FixPlatformVersion(GenericParameterConstraint constraint)
+        {
+            if (constraint == null)
+                return;
+
+            FixPlatformVersion(constraint.ConstraintType);
+            if (constraint.HasCustomAttributes)
+                foreach (CustomAttribute ca in constraint.CustomAttributes)
+                    FixPlatformVersion(ca);
+        }
+
+        public void FixPlatformVersion(TypeReference reference)
+        {
+            if (reference == null)
+                return;
+
+            AssemblyNameReference scopeAsm = reference.Scope as AssemblyNameReference;
+            if (scopeAsm == null)
                 return;
 
             if (reference is TypeSpecification)
@@ -128,6 +179,9 @@ namespace ILRepacking
             }
             else if (!(reference is GenericParameter))
             {
+                var platformAsm = GetFixedPlatformVersion(scopeAsm);
+                if (platformAsm == null) return;
+
                 reference.Scope = platformAsm;
             }
             if (reference.HasGenericParameters)
@@ -153,7 +207,7 @@ namespace ILRepacking
 
         public void FixPlatformVersion(MethodReference reference)
         {
-            if (reference == null || targetPlatformDirectory == null)
+            if (reference == null)
                 return;
 
             if (reference.IsGenericInstance)
@@ -174,7 +228,7 @@ namespace ILRepacking
 
         public void FixPlatformVersion(FieldReference reference)
         {
-            if (reference == null || targetPlatformDirectory == null)
+            if (reference == null)
                 return;
 
             FixPlatformVersion(reference.FieldType);
@@ -192,7 +246,7 @@ namespace ILRepacking
         private void FixPlatformVersion(GenericParameter gp)
         {
             if (gp.HasConstraints)
-                foreach (TypeReference tr in gp.Constraints)
+                foreach (var tr in gp.Constraints)
                     FixPlatformVersion(tr);
             if (gp.HasCustomAttributes)
                 foreach (CustomAttribute ca in gp.CustomAttributes)

@@ -27,6 +27,7 @@ namespace ILRepacking.Steps
         private readonly ILogger _logger;
         private readonly IRepackContext _repackContext;
         private static readonly Regex VersionRegex = new Regex("v(.?\\d)+;", RegexOptions.IgnoreCase);
+        private static readonly Regex AssemblyRegex = new Regex("/([^/]*?);component", RegexOptions.IgnoreCase);
 
         public XamlResourcePathPatcherStep(ILogger logger, IRepackContext repackContext)
         {
@@ -36,13 +37,51 @@ namespace ILRepacking.Steps
 
         public void Perform()
         {
-            var types = _repackContext.TargetAssemblyDefinition.Modules.SelectMany(m => m.Types);
+            var relevantTypes = GetTypesWhichMayContainPackUris();
 
             _logger.Verbose("Processing XAML resource paths ...");
+            foreach (var type in relevantTypes)
+            {
+                PatchWpfPackUrisInClrStrings(type);
+                PatchWpfToolkitVersionResourceDictionary(type);
+            }
+        }
+
+        private IEnumerable<TypeDefinition> GetTypesWhichMayContainPackUris()
+        {
+            var types = _repackContext.TargetAssemblyDefinition.Modules.SelectMany(m => m.Types);
+
+            var isModuleReferencingWpfMap = new Dictionary<ModuleDefinition, bool>();
+
             foreach (var type in types)
             {
-                PatchIComponentConnector(type);
-                PatchWpfToolkitVersionResourceDictionary(type);
+                var originalModule = _repackContext.MappingHandler.GetOriginalModule(type);
+                if (!isModuleReferencingWpfMap.TryGetValue(originalModule, out var isReferencingWpf))
+                {
+                    isModuleReferencingWpfMap[originalModule] = isReferencingWpf = IsModuleDefinitionReferencingWpf(originalModule);
+                }
+
+                if (!isReferencingWpf)
+                {
+                    continue;
+                }
+
+                yield return type;
+            }
+        }
+
+        private bool IsModuleDefinitionReferencingWpf(ModuleDefinition module)
+        {
+            // checking for PresentationFramework instead of PresentationCore, as for example
+            // AnotherClassLibrary only references PresenationFramework but not PresentationCore
+            return module.AssemblyReferences.Any(y => y.Name == "PresentationFramework");
+        }
+
+        private void PatchWpfPackUrisInClrStrings(TypeDefinition type)
+        {
+            foreach (var method in type.Methods.Where(x => x.HasBody))
+            {
+                PatchMethod(method);
             }
         }
 
@@ -65,21 +104,6 @@ namespace ILRepacking.Steps
             }
 
             PatchWpfToolkitEndInitMethod(endInitMethod);
-        }
-
-        private void PatchIComponentConnector(TypeDefinition type)
-        {
-            if (!type.Interfaces.Any(t => t.FullName == "System.Windows.Markup.IComponentConnector"))
-                return;
-
-            var initializeMethod = type.Methods.FirstOrDefault(m =>
-                m.Name == "InitializeComponent" && m.Parameters.Count == 0);
-
-            if (initializeMethod == null || !initializeMethod.HasBody)
-                return;
-
-            _logger.Verbose(" - Patching type " + type.FullName);
-            PatchMethod(initializeMethod);
         }
 
         private void PatchWpfToolkitEndInitMethod(MethodDefinition method)
@@ -128,13 +152,13 @@ namespace ILRepacking.Steps
             string patchedPath = path;
             if (primaryAssembly == sourceAssembly)
             {
-                if (otherAssemblies.Any(assembly => TryPatchPath(path, primaryAssembly, assembly, out patchedPath)))
+                if (otherAssemblies.Any(assembly => TryPatchPath(path, primaryAssembly, assembly, otherAssemblies, true, out patchedPath)))
                     return patchedPath;
 
                 return path;
             }
 
-            if (TryPatchPath(path, primaryAssembly, sourceAssembly, out patchedPath))
+            if (TryPatchPath(path, primaryAssembly, sourceAssembly, otherAssemblies, false, out patchedPath))
                 return patchedPath;
 
             if (!path.EndsWith(".xaml"))
@@ -147,18 +171,47 @@ namespace ILRepacking.Steps
         }
 
         private static bool TryPatchPath(
-            string path, AssemblyDefinition primaryAssembly, AssemblyDefinition referenceAssembly, out string patchedPath)
+            string path, 
+            AssemblyDefinition primaryAssembly,
+            AssemblyDefinition referenceAssembly,
+            IList<AssemblyDefinition> otherAssemblies, 
+            bool isPrimarySameAsSource,
+            out string patchedPath)
         {
             // get rid of potential versions in the path
             // Starting with a new .NET MSBuild version, in case the project is built
             // via a new-format .csproj, the version is appended
             path = VersionRegex.Replace(path, string.Empty);
 
-            string referenceAssemblyPath = GetAssemblyPath(referenceAssembly);
-            string newPath = GetAssemblyPath(primaryAssembly) + "/" + referenceAssembly.Name.Name;
-
             // /library;component/file.xaml -> /primary;component/library/file.xaml
-            patchedPath = path.Replace(referenceAssemblyPath, newPath);
+            if (isPrimarySameAsSource)
+            {
+                string referenceAssemblyPath = GetAssemblyPath(referenceAssembly);
+                string newPath = GetAssemblyPath(primaryAssembly) + "/" + referenceAssembly.Name.Name;
+
+                patchedPath = path.Replace(referenceAssemblyPath, newPath);
+            }
+            else
+            {
+                patchedPath = AssemblyRegex.Replace(path, m =>
+                {
+                    if (m.Groups.Count == 2)
+                    {
+                        if (otherAssemblies.Any(a => a.Name.Name == m.Groups[1].Value))
+                        {
+                            return GetAssemblyPath(primaryAssembly) + "/" + m.Groups[1].Value;
+                        }
+                        else
+                        {
+                            return m.Value;
+                        }
+                    }
+                    else
+                    {
+                        return m.Value;
+                    }
+                });
+            }
 
             // if they're modified, we're good!
             return !ReferenceEquals(patchedPath, path);

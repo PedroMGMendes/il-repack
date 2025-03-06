@@ -2,6 +2,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 
 namespace ILRepack.IntegrationTests
 {
@@ -53,13 +54,40 @@ namespace ILRepack.IntegrationTests
             RunScenario("DotNet462NetStandard2");
         }
 
+        [Test]
+        public void GivenNetCore3WinFormsAppUsesImageResources_MergedCore3WinFormsApplicationRunsSuccessfully()
+        {
+            RunScenario("WindowsFormsTestNetCoreApp");
+        }
+
+        [Test]
+        public void GivenNetCore3WpfAppUsesImageResources_MergedCore3WpfApplicationRunsSuccessfully()
+        {
+            RunScenario("WPFSampleApplicationCore");
+        }
+
+        [Test]
+        public void GivenLibraryWithWpfPackUrisInClrStrings_MergedWpfApplicationRunsSuccessfully()
+        {
+            RunScenario("WPFPackUrisInClrStringsApplicationCore");
+        }
+
         private void RunScenario(string scenarioName)
         {
             string scenarioExecutable = GetScenarioExecutable(scenarioName);
 
             AssertFileExists(scenarioExecutable);
 
-            var processStartInfo = new ProcessStartInfo(scenarioExecutable)
+            string fileName = scenarioExecutable;
+            string arguments = null;
+
+            if (fileName.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+            {
+                arguments = fileName;
+                fileName = "dotnet";
+            }
+
+            var processStartInfo = new ProcessStartInfo(fileName, arguments)
             {
                 RedirectStandardOutput = true,
                 UseShellExecute = false
@@ -77,16 +105,27 @@ namespace ILRepack.IntegrationTests
 
         private string GetScenarioExecutable(string scenarioName)
         {
-            string scenariosDirectory = Path.Combine(TestContext.CurrentContext.TestDirectory, @"..\..\Scenarios\");
+            string scenariosDirectory = Path.Combine(TestContext.CurrentContext.TestDirectory, @"..\..\..\Scenarios\");
+            scenariosDirectory = Path.GetFullPath(scenariosDirectory);
             string scenarioDirectory = Path.Combine(scenariosDirectory, scenarioName);
-            string scenarioExecutableFileName = scenarioName + ".exe";
 
-            return Path.GetFullPath(Path.Combine(
+            var directory = Path.Combine(
                 scenarioDirectory,
                 "bin",
-                GetRunningConfiguration(),
-                "merged",
-                scenarioExecutableFileName));
+                GetRunningConfiguration());
+            directory = Path.GetFullPath(directory);
+            var targetFrameworks = Directory
+                .GetDirectories(directory)
+                .Where(d => Directory.Exists(Path.Combine(d, "merged")));
+            directory = targetFrameworks.FirstOrDefault();
+            directory = Path.Combine(directory, "merged");
+            var filePath = Path.Combine(directory, scenarioName + ".exe");
+            if (!File.Exists(filePath))
+            {
+                filePath = Path.Combine(directory, scenarioName + ".dll");
+            }
+
+            return filePath;
         }
 
         private static void AssertFileExists(string filePath)

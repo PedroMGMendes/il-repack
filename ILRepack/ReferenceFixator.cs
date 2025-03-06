@@ -45,6 +45,27 @@ namespace ILRepacking
             return nmr;
         }
 
+        private AssemblyNameReference Fix(AssemblyNameReference assemblyNameReference)
+        {
+            if (assemblyNameReference == null)
+            {
+                return assemblyNameReference;
+            }
+
+            string newFullName = _repackContext.FixAssemblyName(assemblyNameReference.FullName);
+            if (newFullName != assemblyNameReference.FullName)
+            {
+                return new AssemblyNameReference(newFullName, assemblyNameReference.Version)
+                {
+                    Attributes = assemblyNameReference.Attributes,
+                    Culture = assemblyNameReference.Culture,
+                    Hash = assemblyNameReference.Hash,
+                };
+            }
+
+            return assemblyNameReference;
+        }
+
         private FieldReference Fix(FieldReference field)
         {
             field.DeclaringType = Fix(field.DeclaringType);
@@ -111,6 +132,15 @@ namespace ILRepacking
                 FixOverridenMethodDef(meth);
         }
 
+        private void FixReferences(Collection<GenericParameterConstraint> constraints)
+        {
+            foreach (var constraint in constraints)
+            {
+                constraint.ConstraintType = Fix(constraint.ConstraintType);
+                FixReferences(constraint.CustomAttributes);
+            }
+        }
+
         internal void FixReferences(TypeDefinition type)
         {
             FixReferences(type.GenericParameters);
@@ -118,7 +148,11 @@ namespace ILRepacking
             type.BaseType = Fix(type.BaseType);
 
             // interfaces before methods, because methods will have to go through them
-            FixReferences(type.Interfaces);
+            foreach (InterfaceImplementation nested in type.Interfaces)
+            {
+                nested.InterfaceType = Fix(nested.InterfaceType);
+                FixReferences(nested.CustomAttributes);
+            }
 
             // nested types first
             foreach (TypeDefinition nested in type.NestedTypes)
@@ -256,6 +290,55 @@ namespace ILRepacking
             FixReferences(meth.MethodReturnType.CustomAttributes);
             if (meth.HasBody)
                 FixReferences(meth.Body);
+
+            FixReferences(meth.DebugInformation);
+        }
+
+        private void FixReferences(MethodDebugInformation debugInformation)
+        {
+            if (debugInformation == null)
+            {
+                return;
+            }
+
+            FixReferences(debugInformation.Scope);
+        }
+
+        private void FixReferences(ScopeDebugInformation scope)
+        {
+            if (scope == null)
+            {
+                return;
+            }
+
+            if (scope.HasScopes)
+            {
+                foreach (var child in scope.Scopes)
+                {
+                    FixReferences(child);
+                }
+            }
+
+            FixReferences(scope.Import);
+        }
+
+        private void FixReferences(ImportDebugInformation import)
+        {
+            if (import == null || !import.HasTargets)
+            {
+                return;
+            }
+
+            foreach (var target in import.Targets)
+            {
+                if (target.Type == null && target.AssemblyReference == null)
+                {
+                    continue;
+                }
+
+                target.Type = Fix(target.Type);
+                target.AssemblyReference = Fix(target.AssemblyReference);
+            }
         }
 
         private void FixReferences(MethodBody body)
@@ -284,6 +367,14 @@ namespace ILRepacking
             {
                 var call_site = (Mono.Cecil.CallSite)instr.Operand;
                 call_site.ReturnType = Fix(call_site.ReturnType);
+                if (call_site.HasParameters)
+                {
+                    for (int i = 0; i < call_site.Parameters.Count; i++)
+                    {
+                        var parameter = call_site.Parameters[i];
+                        parameter.ParameterType = Fix(parameter.ParameterType);
+                    }
+                }
             }
             else switch (instr.OpCode.OperandType)
                 {
@@ -332,7 +423,7 @@ namespace ILRepacking
         {
             if (typeAttribute == null)
                 return false;
-            if (typeAttribute.Interfaces.Any(@interface => @interface.FullName == "java.lang.annotation.Annotation"))
+            if (typeAttribute.Interfaces.Any(@interface => @interface.InterfaceType.FullName == "java.lang.annotation.Annotation"))
                 return true;
             return typeAttribute.BaseType != null && IsAnnotation(typeAttribute.BaseType.Resolve());
         }
@@ -447,9 +538,13 @@ namespace ILRepacking
                                      ? method.ReturnType
                                      : method.Parameters.First(x => x.ParameterType.IsDefinition).ParameterType;
                 // warn about invalid merge assembly set, as this method is not gonna work fine (peverify would warn as well)
-                _logger.Warn("Method reference is used with definition return type / parameter. Indicates a likely invalid set of assemblies, consider one of the following");
-                _logger.Warn(" - Remove the assembly defining " + culprit + " from the merge");
-                _logger.Warn(" - Add assembly defining " + method + " to the merge");
+                string text = 
+@$"Method reference is used with definition return type / parameter.
+Indicates a likely invalid set of assemblies, consider one of the following:
+ - Remove the assembly defining {culprit} from the merge
+ - Add assembly defining {method} to the merge: {method.DeclaringType.Scope}
+";
+                _logger.Warn(text);
 
                 // one case where it'll work correctly however (but doesn't seem common):
                 // A references B

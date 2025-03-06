@@ -172,11 +172,13 @@ namespace ILRepack.Tests
         }
 
         [Test]
-        [ExpectedException(typeof(RepackOptions.InvalidTargetKindException))]
         public void WithOptionTargetKindInvalid__Parse__TargetKindIsSet()
         {
-            commandLine.Setup(cmd => cmd.Option("target")).Returns("notsupportedtype");
-            Parse();
+            Assert.Throws<RepackOptions.InvalidTargetKindException>(() =>
+            {
+                commandLine.Setup(cmd => cmd.Option("target")).Returns("notsupportedtype");
+                Parse();
+            });
         }
 
         [Test]
@@ -230,7 +232,7 @@ namespace ILRepack.Tests
         public void WithOptionKeyContainerSet_WithDelaySign__Parse__NoException()
         {
             commandLine.Setup(cmd => cmd.Option("out")).Returns("filename");
-            commandLine.Setup(cmd => cmd.OtherAguments).Returns(new[] { "A", "B", "C" });
+            commandLine.Setup(cmd => cmd.OtherArguments).Returns(new[] { "A", "B", "C" });
             commandLine.Setup(cmd => cmd.Option("keycontainer")).Returns("containername");
             commandLine.Setup(cmd => cmd.Modifier("delaysign")).Returns(true);
             Parse();
@@ -256,37 +258,43 @@ namespace ILRepack.Tests
         }
 
         [Test]
-        [ExpectedException(typeof(ArgumentException), ExpectedMessage = "No input files given.")]
         public void WithNoInputAssemblies__ParseProperties__ThrowException()
         {
-            commandLine.Setup(cmd => cmd.Option("out")).Returns("filename");
-            Parse();
-            options.Validate();
+            Assert.Throws<ArgumentException>(() =>
+            {
+                commandLine.Setup(cmd => cmd.Option("out")).Returns("filename");
+                Parse();
+                options.Validate();
+            }, "No input files given.");
         }
 
         [Test]
-        [ExpectedException(typeof(ArgumentException), ExpectedMessage = "KeyFile does not exist", MatchType = MessageMatch.Contains)]
         public void WithNoKeyFile__ParseProperties__ThrowException()
         {
-            var inputAssemblies = new List<string> { "A", "B", "C" };
-            commandLine.Setup(cmd => cmd.Option("out")).Returns("filename");
-            commandLine.Setup(cmd => cmd.OtherAguments).Returns(inputAssemblies.ToArray());
-            commandLine.Setup(cmd => cmd.Option("keyfile")).Returns("filename");
-            Parse();
-            options.Validate();
+            Assert.Throws<ArgumentException>(() =>
+            {
+                var inputAssemblies = new List<string> { "A", "B", "C" };
+                commandLine.Setup(cmd => cmd.Option("out")).Returns("filename");
+                commandLine.Setup(cmd => cmd.OtherArguments).Returns(inputAssemblies.ToArray());
+                commandLine.Setup(cmd => cmd.Option("keyfile")).Returns("filename");
+                Parse();
+                options.Validate();
+            });
         }
 
         [Test]
-        [ExpectedException(typeof(ArgumentException), ExpectedMessage = "KeyFile does not exist", MatchType = MessageMatch.Contains)]
         public void WithNoKeyFileEvenWithKeyContainer__ParseProperties__ThrowException()
         {
-            var inputAssemblies = new List<string> { "A", "B", "C" };
-            commandLine.Setup(cmd => cmd.Option("out")).Returns("filename");
-            commandLine.Setup(cmd => cmd.OtherAguments).Returns(inputAssemblies.ToArray());
-            commandLine.Setup(cmd => cmd.Option("keyfile")).Returns("filename");
-            commandLine.Setup(cmd => cmd.Option("keycontainer")).Returns("containername");
-            Parse();
-            options.Validate();
+            Assert.Throws<ArgumentException>(() =>
+            {
+                var inputAssemblies = new List<string> { "A", "B", "C" };
+                commandLine.Setup(cmd => cmd.Option("out")).Returns("filename");
+                commandLine.Setup(cmd => cmd.OtherArguments).Returns(inputAssemblies.ToArray());
+                commandLine.Setup(cmd => cmd.Option("keyfile")).Returns("filename");
+                commandLine.Setup(cmd => cmd.Option("keycontainer")).Returns("containername");
+                Parse();
+                options.Validate();
+            });
         }
 
         [Test]
@@ -296,7 +304,7 @@ namespace ILRepack.Tests
             const string keyFile = "keyfilepath";
             var keyFileLines = new List<string> { "key1" };
             commandLine.Setup(cmd => cmd.Option("out")).Returns("outfilepath");
-            commandLine.Setup(cmd => cmd.OtherAguments).Returns(inputAssemblies.ToArray());
+            commandLine.Setup(cmd => cmd.OtherArguments).Returns(inputAssemblies.ToArray());
             commandLine.Setup(cmd => cmd.HasOption("internalize")).Returns(true);
             commandLine.Setup(cmd => cmd.Option("internalize")).Returns(keyFile);
             file.Setup(_ => _.Exists(keyFile)).Returns(true);
@@ -345,7 +353,7 @@ namespace ILRepack.Tests
         {
             var inputAssemblies = new List<string> { "A", "B", "C" };
             commandLine.Setup(cmd => cmd.Option("out")).Returns("filename");
-            commandLine.Setup(cmd => cmd.OtherAguments).Returns(inputAssemblies.ToArray());
+            commandLine.Setup(cmd => cmd.OtherArguments).Returns(inputAssemblies.ToArray());
             
             commandLine.Setup(cmd => cmd.HasOption("internalize")).Returns(true);
             commandLine.Setup(cmd => cmd.Option("internalize")).Returns(string.Empty);
@@ -360,7 +368,7 @@ namespace ILRepack.Tests
         {
             var inputAssemblies = new List<string> { "A", "B", "C" };
             commandLine.Setup(cmd => cmd.Option("out")).Returns("filename");
-            commandLine.Setup(cmd => cmd.OtherAguments).Returns(inputAssemblies.ToArray());
+            commandLine.Setup(cmd => cmd.OtherArguments).Returns(inputAssemblies.ToArray());
             
             commandLine.Setup(cmd => cmd.Modifier("renameinternalized")).Returns(true);
             Parse();

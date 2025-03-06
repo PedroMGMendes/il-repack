@@ -15,18 +15,18 @@
 //
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using System.Text.RegularExpressions;
-using ILRepacking.Steps;
-using Mono.Cecil;
-using Mono.Cecil.PE;
-using Mono.Unix.Native;
 using ILRepacking.Mixins;
-using System.Runtime.Serialization.Formatters.Binary;
-using System.Diagnostics;
+using ILRepacking.Steps;
 using ILRepacking.Steps.SourceServerData;
+using Mono.Cecil;
+using Mono.Cecil.Cil;
+using Mono.Cecil.PE;
 
 namespace ILRepacking
 {
@@ -37,16 +37,28 @@ namespace ILRepacking
 
         internal IList<string> MergedAssemblyFiles { get; set; }
         internal string PrimaryAssemblyFile { get; set; }
-        // contains all 'other' assemblies, but not the primary assembly
-        public IList<AssemblyDefinition> OtherAssemblies { get; private set; }
-        // contains all assemblies, primary (first one) and 'other'
-        public IList<AssemblyDefinition> MergedAssemblies { get; private set; }
-        public AssemblyDefinition TargetAssemblyDefinition { get; private set; }
-        public AssemblyDefinition PrimaryAssemblyDefinition { get; private set; }
-        public RepackAssemblyResolver GlobalAssemblyResolver { get; } = new RepackAssemblyResolver();
 
-        public ModuleDefinition TargetAssemblyMainModule => TargetAssemblyDefinition.MainModule;
-        public ModuleDefinition PrimaryAssemblyMainModule => PrimaryAssemblyDefinition.MainModule;
+        // contains all 'other' assemblies, but not the primary assembly
+        internal IList<AssemblyDefinition> OtherAssemblies { get; private set; }
+        // contains all assemblies, primary (first one) and 'other'
+        internal IList<AssemblyDefinition> MergedAssemblies { get; private set; }
+
+        internal AssemblyDefinition TargetAssemblyDefinition { get; private set; }
+        internal AssemblyDefinition PrimaryAssemblyDefinition { get; private set; }
+        internal RepackAssemblyResolver GlobalAssemblyResolver { get; } = new RepackAssemblyResolver();
+
+        internal ModuleDefinition TargetAssemblyMainModule => TargetAssemblyDefinition.MainModule;
+        internal ModuleDefinition PrimaryAssemblyMainModule => PrimaryAssemblyDefinition.MainModule;
+
+        // We need to avoid exposing Cecil types in our public API, so that all of Cecil can be internalized.
+        // See https://github.com/gluck/il-repack/issues/358.
+        RepackAssemblyResolver IRepackContext.GlobalAssemblyResolver => GlobalAssemblyResolver;
+        ModuleDefinition IRepackContext.TargetAssemblyMainModule => TargetAssemblyMainModule;
+        AssemblyDefinition IRepackContext.TargetAssemblyDefinition => TargetAssemblyDefinition;
+        AssemblyDefinition IRepackContext.PrimaryAssemblyDefinition => PrimaryAssemblyDefinition;
+        ModuleDefinition IRepackContext.PrimaryAssemblyMainModule => PrimaryAssemblyMainModule;
+        IList<AssemblyDefinition> IRepackContext.MergedAssemblies => MergedAssemblies;
+        IList<AssemblyDefinition> IRepackContext.OtherAssemblies => OtherAssemblies;
 
         private IKVMLineIndexer _lineIndexer;
         private ReflectionHelper _reflectionHelper;
@@ -73,14 +85,26 @@ namespace ILRepacking
             Options = options;
             Logger = logger;
 
+            if (logger is RepackLogger repackLogger && repackLogger.Open(options.LogFile))
+            {
+                options.Log = true;
+            }
+
             logger.ShouldLogVerbose = options.LogVerbose;
+
+            if (logger.ShouldLogVerbose)
+            {
+                GlobalAssemblyResolver.AssemblyResolved += (assemblyName, filePath) =>
+                {
+                    logger.Verbose($"Resolved '{assemblyName}' from '{filePath}'");
+                };
+            }
 
             _repackImporter = new RepackImporter(Logger, Options, this, _aspOffsets);
         }
 
         private void ReadInputAssemblies()
         {
-            MergedAssemblyFiles = Options.ResolveFiles();
             OtherAssemblies = new List<AssemblyDefinition>();
             // TODO: this could be parallelized to gain speed
             var primary = MergedAssemblyFiles.FirstOrDefault();
@@ -107,14 +131,15 @@ namespace ILRepacking
 
         private AssemblyDefinitionContainer ReadInputAssembly(string assembly, bool isPrimary)
         {
-            Logger.Info("Adding assembly for merge: " + assembly);
+            Logger.Verbose("Adding assembly for merge: " + assembly);
             try
             {
                 ReaderParameters rp = new ReaderParameters(ReadingMode.Immediate) { AssemblyResolver = GlobalAssemblyResolver };
                 // read PDB/MDB?
-                if (Options.DebugInfo && (File.Exists(Path.ChangeExtension(assembly, "pdb")) || File.Exists(assembly + ".mdb")))
+                if (Options.DebugInfo)
                 {
                     rp.ReadSymbols = true;
+                    rp.SymbolReaderProvider = new DefaultSymbolReaderProvider(throwIfNoSymbol: false);
                 }
                 AssemblyDefinition mergeAsm;
                 try
@@ -127,9 +152,10 @@ namespace ILRepacking
                         "ILRepack does not support merging non-.NET libraries (e.g.: native libraries)", e);
                 }
                 // cope with invalid symbol file
-                catch (Exception) when (rp.ReadSymbols)
+                catch (Exception ex) when (rp.ReadSymbols)
                 {
                     rp.ReadSymbols = false;
+                    rp.SymbolReaderProvider = null;
                     try
                     {
                         mergeAsm = AssemblyDefinition.ReadAssembly(assembly, rp);
@@ -139,11 +165,13 @@ namespace ILRepacking
                         throw new InvalidOperationException(
                             "ILRepack does not support merging non-.NET libraries (e.g.: native libraries)", e);
                     }
-                    Logger.Info("Failed to load debug information for " + assembly);
+
+                    Logger.Warn($"Failed to load debug information for {assembly}:{Environment.NewLine}{ex}");
                 }
 
                 if (!Options.AllowZeroPeKind && (mergeAsm.MainModule.Attributes & ModuleAttributes.ILOnly) == 0)
                     throw new ArgumentException("Failed to load assembly with Zero PeKind: " + assembly);
+                GlobalAssemblyResolver.RegisterAssembly(mergeAsm);
 
                 return new AssemblyDefinitionContainer
                 {
@@ -153,9 +181,9 @@ namespace ILRepacking
                     SymbolsRead = rp.ReadSymbols
                 };
             }
-            catch
+            catch (Exception ex)
             {
-                Logger.Error("Failed to load assembly " + assembly);
+                Logger.Error($"Loading {assembly} failed: {ex.Message}");
                 throw;
             }
         }
@@ -214,7 +242,7 @@ namespace ILRepacking
                 .FirstOrDefault(x => Path.GetFileName(x).StartsWith(platformDir) || Path.GetFileName(x).StartsWith($"v{platformDir}"));
             if (targetPlatformDirectory == null)
                 throw new ArgumentException($"Failed to find target platform '{Options.TargetPlatformVersion}' in '{platformBasePath}'");
-            Logger.Info($"Target platform directory resolved to {targetPlatformDirectory}");
+            Logger.Verbose($"Target platform directory resolved to {targetPlatformDirectory}");
             return targetPlatformDirectory;
         }
 
@@ -225,7 +253,7 @@ namespace ILRepacking
                 using (Stream stream = typeInRepackedAssembly.Assembly.GetManifestResourceStream(ResourcesRepackStep.ILRepackListResourceName))
                     if (stream != null)
                     {
-                        string[] list = (string[])new BinaryFormatter().Deserialize(stream);
+                        string[] list = ResourcesRepackStep.GetRepackListFromStream(stream);
                         return list.Select(x => new AssemblyName(x));
                     }
             }
@@ -244,7 +272,7 @@ namespace ILRepacking
         {
             var assemblies = GetRepackAssemblyNames(typeof(ILRepack));
             var ilRepack = GetRepackAssemblyName(assemblies, "ILRepack", typeof(ILRepack));
-            Logger.Info($"IL Repack - Version {ilRepack.Version.ToString(3)}");
+            Logger.Verbose($"IL Repack - Version {ilRepack.Version.ToString(3)}");
             Logger.Verbose($"Runtime: {typeof(ILRepack).Assembly.FullName}");
             Logger.Info(Options.ToCommandLine());
         }
@@ -255,19 +283,96 @@ namespace ILRepacking
         /// </summary>
         public void Repack()
         {
+            Options.Validate();
+
+            string outputFilePath = Options.OutputFile;
+            var outputDir = Path.GetDirectoryName(outputFilePath);
+            var tempOutputDirectory = Path.Combine(outputDir, $"ILRepack-{Process.GetCurrentProcess().Id}-{DateTime.UtcNow.Ticks.ToString().Substring(12)}");
+            EnsureDirectoryExists(tempOutputDirectory);
+
+            try
+            {
+                RepackCore(tempOutputDirectory);
+            }
+            finally
+            {
+                try
+                {
+                    if (Directory.Exists(tempOutputDirectory))
+                    {
+                        Directory.Delete(tempOutputDirectory, recursive: true);
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private void RepackCore(string tempOutputDirectory)
+        {
+            Options.Validate();
+
+            string outputFilePath = Options.OutputFile;
+            var outputDir = Path.GetDirectoryName(outputFilePath);
+            var tempOutputDirectory = Path.Combine(outputDir, $"ILRepack-{Process.GetCurrentProcess().Id}-{DateTime.UtcNow.Ticks.ToString().Substring(12)}");
+            EnsureDirectoryExists(tempOutputDirectory);
+
+            try
+            {
+                RepackCore(tempOutputDirectory);
+            }
+            finally
+            {
+                try
+                {
+                    if (Directory.Exists(tempOutputDirectory))
+                    {
+                        Directory.Delete(tempOutputDirectory, recursive: true);
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private void RepackCore(string tempOutputDirectory)
+        {
             Debugger.Launch();
             var timer = new Stopwatch();
             timer.Start();
-            Options.Validate();
+            MergedAssemblyFiles = Options.ResolveFiles();
+            foreach (var inputFile in MergedAssemblyFiles)
+            {
+                if (!File.Exists(inputFile))
+                {
+                    throw new FileNotFoundException($"Input file not found: {inputFile}");
+                }
+            }
+
             PrintRepackHeader();
+
+            string outputFilePath = Options.OutputFile;
+            var outputDir = Path.GetDirectoryName(outputFilePath);
+            string tempOutputFilePath = Path.Combine(tempOutputDirectory, Path.GetFileName(outputFilePath));
+            Options.OutputFile = tempOutputFilePath;
+
             _reflectionHelper = new ReflectionHelper(this);
             ResolveSearchDirectories();
 
             // Read input assemblies only after all properties are set.
             ReadInputAssemblies();
-            GlobalAssemblyResolver.RegisterAssemblies(MergedAssemblies);
 
-            _platformFixer = new PlatformFixer(this, PrimaryAssemblyMainModule.Runtime);
+            if (!Options.KeepOtherVersionReferences)
+            {
+                _platformFixer = new PlatformAndDuplicateFixer(this, PrimaryAssemblyMainModule.Runtime);
+            }
+            else
+            {
+                _platformFixer = new PlatformFixer(this, PrimaryAssemblyMainModule.Runtime);
+            }
+
             _mappingHandler = new MappingHandler();
             bool hadStrongName = PrimaryAssemblyDefinition.Name.HasPublicKey;
 
@@ -310,27 +415,49 @@ namespace ILRepacking
             }
             // set the main module attributes
             TargetAssemblyMainModule.Attributes = PrimaryAssemblyMainModule.Attributes;
-            TargetAssemblyMainModule.Win32ResourceDirectory = MergeWin32Resources(PrimaryAssemblyMainModule.Win32ResourceDirectory);
+            TargetAssemblyMainModule.Win32ResourceDirectory = MergeWin32Resources();
 
             if (Options.Version != null)
                 TargetAssemblyDefinition.Name.Version = Options.Version;
 
             _lineIndexer = new IKVMLineIndexer(this, Options.LineIndexation);
             var signingStep = new SigningStep(this, Options);
-            var isUnixEnvironment = Environment.OSVersion.Platform == PlatformID.MacOSX || Environment.OSVersion.Platform == PlatformID.Unix;
+
+            bool isUnixEnvironment = Environment.OSVersion.Platform == PlatformID.MacOSX || Environment.OSVersion.Platform == PlatformID.Unix;
+            bool needToCopyPermissions = isUnixEnvironment && (kind == ModuleKind.Console || kind == ModuleKind.Windows);
+            string permissionsText = null;
+
+            string primaryFilePath = Path.GetFullPath(PrimaryAssemblyFile);
+            string primaryDirectory = Path.GetDirectoryName(primaryFilePath);
+
+            if (needToCopyPermissions)
+            {
+                var process = ProcessRunner.Run("stat", $"-f \"%Lp\" \"{primaryFilePath}\"", primaryDirectory);
+                var output = process.Output.Trim('\r', '\n', ' ');
+                if (int.TryParse(output, out int permissions))
+                {
+                    permissionsText = output;
+                }
+
+                Logger.Verbose($"stat \"{primaryFilePath}\" returned {output} (error: {process.ErrorOutput}, exit code: {process.ExitCode})");
+            }
 
             using (var sourceServerDataStep = GetSourceServerDataStep(isUnixEnvironment))
             {
                 List<IRepackStep> repackSteps = new List<IRepackStep>
                 {
                     signingStep,
-                    new ReferencesRepackStep(Logger, this),
+                    new ReferencesRepackStep(Logger, this, Options),
+                    new ModuleInitializersRepackStep(Logger, this, Options),
                     new AddCustomResourceManagerStep(Logger, this,  _repackImporter, Options),
                     new TypesRepackStep(Logger, this, _repackImporter, Options),
+                    new ILLinkFileMergeStep(Logger, this, Options),
                     new ResourcesRepackStep(Logger, this, Options),
                     new AttributesRepackStep(Logger, this, _repackImporter, Options),
                     new ReferencesFixStep(Logger, this, _repackImporter, Options),
+                    new PublicTypesFixStep(Logger, this),
                     new XamlResourcePathPatcherStep(Logger, this),
+                    new SourceLinkStep(Logger, this),
                     sourceServerDataStep
                 };
 
@@ -339,43 +466,142 @@ namespace ILRepacking
                     step.Perform();
                 }
 
+                var anySymbolReader = MergedAssemblies
+                    .Select(m => m.MainModule.SymbolReader)
+                    .Where(r => r != null)
+                    .FirstOrDefault();
+                var symbolWriterProvider = anySymbolReader?.GetWriterProvider();
                 var parameters = new WriterParameters
                 {
-                    StrongNameKeyPair = signingStep.KeyPair,
-                    WriteSymbols = Options.DebugInfo
+                    StrongNameKeyPair = signingStep.KeyInfo?.KeyPair,
+                    StrongNameKeyBlob = signingStep.KeyInfo?.KeyBlob,
+                    WriteSymbols = Options.DebugInfo && symbolWriterProvider != null,
+                    SymbolWriterProvider = symbolWriterProvider,
+                    DeterministicMvid = true
                 };
-                // create output directory if it does not exist
-                var outputDir = Path.GetDirectoryName(Options.OutputFile);
-                if (!string.IsNullOrEmpty(outputDir) && !Directory.Exists(outputDir))
+
+                if (!Options.PreserveTimestamp)
                 {
-                    Logger.Info("Output directory does not exist. Creating output directory: " + outputDir);
-                    Directory.CreateDirectory(outputDir);
+                    parameters.Timestamp = ComputeDeterministicTimestamp();
                 }
 
-                TargetAssemblyDefinition.Write(Options.OutputFile, parameters);
+                Logger.Verbose($"Writing temporary assembly: {tempOutputFilePath}");
+                TargetAssemblyDefinition.Write(tempOutputFilePath, parameters);
 
                 sourceServerDataStep.Write();
 
-                Logger.Info("Writing output assembly to disk");
+                foreach (var assembly in MergedAssemblies)
+                {
+                    assembly.Dispose();
+                }
+
+                TargetAssemblyDefinition.Dispose();
+                GlobalAssemblyResolver.Dispose();
+
+                MoveTempFile(tempOutputDirectory, outputDir);
+
+                Options.OutputFile = outputFilePath;
+
                 // If this is an executable and we are on linux/osx we should copy file permissions from
                 // the primary assembly
-                if (isUnixEnvironment)
+                if (permissionsText != null)
                 {
-                    Stat stat;
-                    Logger.Info("Copying permissions from " + PrimaryAssemblyFile);
-                    Syscall.stat(PrimaryAssemblyFile, out stat);
-                    Syscall.chmod(Options.OutputFile, stat.st_mode);
+                    var process = ProcessRunner.Run("chmod", $"{permissionsText} \"{Options.OutputFile}\"");
+                    if (process.ExitCode < 0)
+                    {
+                        Logger.Warn($"Call to chmod {permissionsText} \"{Options.OutputFile}\" returned {process.ExitCode}");
+                    }
+                    else
+                    {
+                        Logger.Verbose($"chmod {permissionsText} \"{Options.OutputFile}\"");
+                    }
                 }
+
                 if (hadStrongName && !TargetAssemblyDefinition.Name.HasPublicKey)
                     Options.StrongNameLost = true;
 
                 // nice to have, merge .config (assembly configuration file) & .xml (assembly documentation)
-                ConfigMerger.Process(this);
+                if (Options.SkipConfigMerge == false)
+                {
+                    ConfigMerger.Process(this);
+                }
                 if (Options.XmlDocumentation)
                     DocumentationMerger.Process(this);
             }
 
-            Logger.Info($"Finished in {timer.Elapsed}");
+            if (File.Exists(Options.OutputFile))
+            {
+                Logger.Info($"Wrote {Options.OutputFile}");
+            }
+            else
+            {
+                Logger.Info($"Failed to write {Options.OutputFile}");
+            }
+
+            Logger.Verbose($"Finished in {timer.Elapsed}");
+            if (Logger is IDisposable disposable)
+            {
+                disposable.Dispose();
+            }
+        }
+
+        private uint ComputeDeterministicTimestamp()
+        {
+            var sb = new StringBuilder();
+
+            foreach (var assembly in this.MergedAssemblies)
+            {
+                var mvid = assembly.MainModule.Mvid;
+                sb.Append(mvid.ToString());
+            }
+
+            var text = sb.ToString();
+
+            return ComputeHash(text);
+        }
+
+        static uint ComputeHash(string text)
+        {
+            const uint Offset = 2166136261;
+            const uint Prime = 16777619;
+
+            uint hash = Offset;
+
+            unchecked
+            {
+                for (int i = 0; i < text.Length; i++)
+                {
+                    char ch = text[i];
+                    hash = (hash ^ ch) * Prime;
+                }
+            }
+
+            return hash;
+        }
+
+        private void MoveTempFile(string tempDirectory, string finalDirectory)
+        {
+            foreach (var sourceFilePath in Directory.GetFiles(tempDirectory))
+            {
+                var fileName = Path.GetFileName(sourceFilePath);
+                var targetFilePath = Path.Combine(finalDirectory, fileName);
+
+                // delete the destination first if it's a hardlink, otherwise 
+                // we'll accidentally overwrite the original of the hardlink
+                if (File.Exists(targetFilePath))
+                {
+                    File.Delete(targetFilePath);
+                }
+
+                File.Move(sourceFilePath, targetFilePath);
+            }
+
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+
+        private void EnsureDirectoryExists(string directory)
+        {
+            Directory.CreateDirectory(directory);
         }
 
         private ISourceServerDataRepackStep GetSourceServerDataStep(bool isUnixEnvironment)
@@ -392,25 +618,58 @@ namespace ILRepacking
 
         private void ResolveSearchDirectories()
         {
-            foreach (var dir in Options.SearchDirectories)
-                GlobalAssemblyResolver.AddSearchDirectory(dir);
+            var directories = new List<string>();
+
+            foreach (var searchDirectory in Options.SearchDirectories)
+            {
+                directories.Add(searchDirectory);
+            }
+
+            if (directories.Count == 0)
+            {
+                foreach (var input in MergedAssemblyFiles)
+                {
+                    if (!Path.IsPathRooted(input))
+                    {
+                        continue;
+                    }
+
+                    var directory = Path.GetDirectoryName(input);
+                    directory = Path.GetFullPath(directory);
+                    directories.Add(directory);
+                }
+            }
+
             var targetPlatformDirectory = Options.TargetPlatformDirectory ?? ResolveTargetPlatformDirectory(Options.TargetPlatformVersion);
             if (targetPlatformDirectory != null)
             {
-                GlobalAssemblyResolver.AddSearchDirectory(targetPlatformDirectory);
+                directories.Add(targetPlatformDirectory);
                 var facadesDirectory = Path.Combine(targetPlatformDirectory, "Facades");
                 if (Directory.Exists(facadesDirectory))
-                    GlobalAssemblyResolver.AddSearchDirectory(facadesDirectory);
+                {
+                    directories.Add(facadesDirectory);
+                }
+            }
+
+            directories = directories.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+            foreach (var dir in directories)
+            {
+                GlobalAssemblyResolver.AddSearchDirectory(dir);
             }
         }
 
-        private ResourceDirectory MergeWin32Resources(ResourceDirectory primary)
+        private ResourceDirectory MergeWin32Resources()
         {
-            if (primary == null)
-                return null;
+            var primary = PrimaryAssemblyMainModule.ReadWin32ResourceDirectory() ?? new ResourceDirectory();
+
             foreach (var ass in OtherAssemblies)
             {
-                MergeDirectory(new List<ResourceEntry>(), primary, ass, ass.MainModule.Win32ResourceDirectory);
+                var directory = ass.MainModule.ReadWin32ResourceDirectory();
+                if (directory != null)
+                {
+                    MergeDirectory(new List<ResourceEntry>(), primary, ass, directory);
+                }
             }
             return primary;
         }

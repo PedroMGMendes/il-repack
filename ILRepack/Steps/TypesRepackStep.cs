@@ -57,7 +57,7 @@ namespace ILRepacking.Steps
 
         private void RepackTypes()
         {
-            _logger.Info("Processing types");
+            _logger.Verbose("Processing types");
 
             // merge types, this differs between 'primary' and 'other' assemblies regarding internalizing
 
@@ -67,78 +67,167 @@ namespace ILRepacking.Steps
                 _repackImporter.Import(r, _repackContext.TargetAssemblyMainModule.Types, false, ShouldRename(r.FullName));
             }
 
-            foreach (var r in _repackContext.OtherAssemblies.SelectMany(x => x.Modules).SelectMany(m => m.Types))
+            foreach (var module in _repackContext.OtherAssemblies.SelectMany(x => x.Modules))
             {
-                _logger.Verbose($"- Importing {r} from {r.Module}");
-                _repackImporter.Import(r, _repackContext.TargetAssemblyMainModule.Types, ShouldInternalize(r.FullName), ShouldRename(r.FullName));
+                bool internalizeAssembly = ShouldInternalizeAssembly(module.Assembly.Name.Name);
+                foreach (var r in module.Types)
+                {
+                    _logger.Verbose($"- Importing {r} from {r.Module}");
+                    _repackImporter.Import(r, _repackContext.TargetAssemblyMainModule.Types, ShouldInternalize(r, internalizeAssembly), ShouldRename(r.FullName));
+                }
             }
         }
 
-        private bool SkipExportedType(ExportedType type)
+        private bool IsTypeForwarder(ExportedType exportedType)
         {
-            bool parentIsForwarder = type.DeclaringType != null && type.DeclaringType.IsForwarder;
-            bool forwarded = type.IsForwarder || parentIsForwarder;
+            if (exportedType.IsForwarder)
+            {
+                return true;
+            }
 
-            return forwarded && _allTypes.Any(t => t.FullName == type.FullName);
+            if (exportedType.DeclaringType is { } declaringType)
+            {
+                return IsTypeForwarder(declaringType);
+            }
+
+            return false;
         }
 
         private void RepackExportedTypes()
         {
             var targetAssemblyMainModule = _repackContext.TargetAssemblyMainModule;
-            _logger.Info("Processing exported types");
-            foreach (var m in _repackContext.MergedAssemblies.SelectMany(x => x.Modules))
+            _logger.Verbose("Processing exported types");
+
+            foreach (var module in _repackContext.MergedAssemblies.SelectMany(x => x.Modules))
             {
-                foreach (var r in m.ExportedTypes)
+                bool isPrimaryAssembly = module.Assembly == _repackContext.PrimaryAssemblyDefinition;
+                bool internalizeAssembly = !isPrimaryAssembly && ShouldInternalizeAssembly(module.Assembly.Name.Name);
+
+                foreach (var exportedType in module.ExportedTypes)
                 {
-                    if (SkipExportedType(r))
+                    TypeReference reference = null;
+                    bool forwardedToTargetAssembly = false;
+
+                    if (IsTypeForwarder(exportedType))
+                    {
+                        var forwardedTo = _allTypes.FirstOrDefault(t => t.FullName == exportedType.FullName);
+                        if (forwardedTo != null)
+                        {
+                            forwardedToTargetAssembly = true;
+                            reference = forwardedTo;
+                        }
+                    }
+
+                    if (reference == null)
+                    {
+                        reference = CreateReference(exportedType);
+                    }
+
+                    _repackContext.MappingHandler.StoreExportedType(
+                        module,
+                        exportedType.FullName,
+                        reference);
+
+                    if (ShouldInternalize(exportedType.FullName, internalizeAssembly))
+                    {
                         continue;
+                    }
 
-                    _repackContext.MappingHandler.StoreExportedType(m, r.FullName, CreateReference(r));
+                    if (forwardedToTargetAssembly)
+                    {
+                        continue;
+                    }
+
+                    _logger.Verbose($"- Importing Exported Type {exportedType} from {exportedType.Scope}");
+                    _repackImporter.Import(
+                        exportedType,
+                        targetAssemblyMainModule.ExportedTypes,
+                        targetAssemblyMainModule);
                 }
             }
+        }
 
-            foreach (var r in _repackContext.PrimaryAssemblyDefinition.Modules.SelectMany(x => x.ExportedTypes))
+        private bool ShouldInternalizeAssembly(string assemblyShortName)
+        {
+            bool internalizeAssembly = _repackOptions.InternalizeAssemblies.Contains(assemblyShortName, StringComparer.OrdinalIgnoreCase);
+
+            if (!_repackOptions.Internalize && !internalizeAssembly)
             {
-                _logger.Verbose($"- Importing Exported Type {r} from {r.Scope}");
-                _repackImporter.Import(
-                    r, targetAssemblyMainModule.ExportedTypes, targetAssemblyMainModule);
+                return false;
             }
 
-            foreach (var m in _repackContext.OtherAssemblies.SelectMany(x => x.Modules))
+            if (_repackOptions.ExcludeInternalizeAssemblies.Contains(assemblyShortName, StringComparer.OrdinalIgnoreCase))
             {
-                foreach (var r in m.ExportedTypes)
-                { 
-                    if (!ShouldInternalize(r.FullName) &&
-                        !SkipExportedType(r))
-                    {
-                        _logger.Verbose($"- Importing Exported Type {r} from {m}");
-                        _repackImporter.Import(r, targetAssemblyMainModule.ExportedTypes, targetAssemblyMainModule);
-                    }
-                    else
-                    {
-                        _logger.Verbose($"- Skipping Exported Type {r} from {m}");
-                    }
-                }
+                return false;
             }
+
+            return true;
         }
 
         /// <summary>
         /// Check if a type's FullName matches a Regex to exclude it from internalizing.
         /// </summary>
-        private bool ShouldInternalize(string typeFullName)
+        private bool ShouldInternalize(string typeFullName, bool internalizeAssembly)
         {
-            if (!_repackOptions.Internalize)
+            if (!internalizeAssembly)
+            {
                 return false;
+            }
 
             if (_repackOptions.ExcludeInternalizeMatches.Count == 0)
+            {
                 return true;
+            }
 
             string withSquareBrackets = "[" + typeFullName + "]";
             foreach (Regex r in _repackOptions.ExcludeInternalizeMatches)
+            {
                 if (r.IsMatch(typeFullName) || r.IsMatch(withSquareBrackets))
+                {
                     return false;
+                }
+            }
 
             return true;
+        }
+
+        private bool ShouldInternalize(TypeDefinition type, bool internalizeAssembly)
+        {
+            if (!internalizeAssembly)
+            {
+                return false;
+            }
+
+            if (_repackOptions.ExcludeInternalizeSerializable && IsSerializableAndPublic(type))
+            {
+                return false;
+            }
+
+            return ShouldInternalize(type.FullName, internalizeAssembly);
+        }
+
+        private bool IsSerializableAndPublic(TypeDefinition type)
+        {
+            if (!type.IsPublic && !type.IsNestedPublic) return false;
+
+            if (type.Attributes.HasFlag(TypeAttributes.Serializable))
+                return true;
+
+            if (type.HasCustomAttributes && type.CustomAttributes.Any(IsSerializable))
+            {
+                return true;
+            }
+
+            return type.HasNestedTypes && type.NestedTypes.Any(IsSerializableAndPublic);
+        }
+
+        private bool IsSerializable(CustomAttribute attribute)
+        {
+            var name = attribute.AttributeType.FullName;
+            return name == "System.Runtime.Serialization.DataContractAttribute" ||
+                   name == "System.ServiceModel.ServiceContractAttribute" ||
+                   name == "System.Xml.Serialization.XmlRootAttribute" ||
+                   name == "System.Xml.Serialization.XmlTypeAttribute";
         }
 
         private bool ShouldRename(string typeFullName)

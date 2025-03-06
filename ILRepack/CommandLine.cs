@@ -15,21 +15,49 @@
 //
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
-using System.Text;
 
 namespace ILRepacking
 {
     public class CommandLine : ICommandLine
     {
         private readonly List<string> parameters;
+        private readonly IReadOnlyList<string> originalCommandLine;
 
         public CommandLine(IEnumerable<string> args)
         {
             parameters = new List<string>(args);
+            InlineResponseFiles();
+            originalCommandLine = parameters.ToArray();
         }
 
-        public string[] OtherAguments
+        private void InlineResponseFiles()
+        {
+            var responseFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            while (parameters.FirstOrDefault(a => a.StartsWith("@")) is string responseFile)
+            {
+                parameters.Remove(responseFile);
+                responseFile = responseFile.Substring(1);
+                var filePath = Path.GetFullPath(responseFile);
+                if (File.Exists(filePath) && responseFiles.Add(filePath))
+                {
+                    var lines = File.ReadAllLines(filePath);
+                    foreach (var line in lines)
+                    {
+                        if (string.IsNullOrWhiteSpace(line) || line.StartsWith("#"))
+                        {
+                            continue;
+                        }
+
+                        parameters.Add(line.Trim());
+                    }
+                }
+            }
+        }
+
+        public string[] OtherArguments
         {
             get
             {
@@ -54,10 +82,33 @@ namespace ILRepacking
 
         public bool HasOption(string name)
         {
-            return parameters.Any(x =>
-                x.ToLower().StartsWith("/" + name) ||
-                x.ToLower().StartsWith("-" + name) ||
-                x.ToLower().StartsWith("--" + name));
+            return parameters.Any(x => 
+            {
+                string lower = x.ToLowerInvariant();
+
+                bool isPrefix1 = 
+                    lower.StartsWith("/" + name) ||
+                    lower.StartsWith("-" + name);
+
+                bool isPrefix2 = lower.StartsWith("--" + name);
+
+                bool isPrefix = isPrefix1 || isPrefix2;
+                if (!isPrefix)
+                {
+                    return false;
+                }
+
+                int prefixLength = isPrefix2 ? 2 : 1;
+
+                // if it's a prefix of another word, don't accept it
+                // e.g. don't match /internalizeassembly when asking for HasOption("/internalize")
+                if (lower.Length > name.Length + prefixLength && char.IsLetterOrDigit(lower[name.Length + prefixLength]))
+                {
+                    return false;
+                }
+
+                return true;
+            });
         }
 
         public string[] Options(string name)
@@ -98,8 +149,12 @@ namespace ILRepacking
                 return string.Empty;
             if (ret[0] != ':' && ret[0] != '=')
                 return null;
-            return ret.Substring(1).Trim();
+            return ret.Substring(1).Trim('"').Trim();
         }
 
+        public override string ToString()
+        {
+            return string.Join(" ", originalCommandLine);
+        }
     }
 }

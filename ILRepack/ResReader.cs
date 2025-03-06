@@ -187,11 +187,11 @@ namespace ILRepacking
 
     internal sealed class ResReader : IEnumerable<Res>, IDisposable
     {
+        public string ReaderType { get; private set; }
         private BinaryReader _store;    // backing store we're reading from.
         private readonly long _nameSectionOffset;  // Offset to name section of file.
         private readonly long _dataSectionOffset;  // Offset to Data section of file.
         private readonly int _numResources;    // Num of resources files, in case arrays aren't allocated.
-        private readonly BinaryFormatter _bf;
 
         // Version number of .resources file, for compatibility
         private readonly int _version;
@@ -203,7 +203,6 @@ namespace ILRepacking
         public ResReader(Stream stream)
         {
             _store = new BinaryReader(stream, Encoding.UTF8);
-            _bf = new BinaryFormatter(null, new StreamingContext(StreamingContextStates.File | StreamingContextStates.Persistence));
             try
             {
                 // Read ResourceManager header
@@ -226,7 +225,7 @@ namespace ILRepacking
 
                     // Read in type name for a suitable ResourceReader
                     // Note ResourceWriter & InternalResGen use different Strings.
-                    String readerType = _store.ReadString();
+                    ReaderType = _store.ReadString();
 
                     // Skip over type name for a suitable ResourceSet
                     SkipString();
@@ -436,8 +435,7 @@ namespace ILRepacking
                         }
                 }
 
-                // Normal serialized objects
-                return _bf.Deserialize(_store.BaseStream);
+                throw new NotSupportedException($"Reading resources of type {typeCode} is not supported.");
             }
         }
 
@@ -501,7 +499,7 @@ namespace ILRepacking
                 }
 
                 // Normal serialized objects
-                return _bf.Deserialize(_store.BaseStream);
+                throw new NotSupportedException($"Reading resources of type {type} is not supported.");
             }
         }
 
