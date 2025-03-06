@@ -52,6 +52,7 @@ namespace ILRepacking
                     }
                 }
             }
+        }
 
         public string RenameNameSpacesFile
         {
